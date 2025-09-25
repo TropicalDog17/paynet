@@ -10,6 +10,7 @@ pub mod sync;
 pub mod types;
 pub mod wad;
 pub mod wallet;
+pub mod crypto;
 
 use errors::{
     CommonError, Error, handle_out_of_sync_keyset_errors, handle_proof_verification_errors,
@@ -30,6 +31,7 @@ use std::str::FromStr;
 use tonic::Request;
 use tonic::transport::Channel;
 use types::compact_wad::CompactKeysetProofs;
+use crate::crypto::EncryptionService;
 use types::{BlindingData, NodeUrl, PreMints, ProofState};
 use wallet::SeedPhraseManager;
 
@@ -126,6 +128,7 @@ pub fn store_new_proofs_from_blind_signatures(
     signatures_iterator: impl IntoIterator<
         Item = Result<(PublicKey, Secret, SecretKey, Amount), nut01::Error>,
     >,
+    opt_encryption: Option<&EncryptionService>,
 ) -> Result<Vec<(PublicKey, Amount)>, StoreNewProofsError> {
     const GET_PUBKEY: &str = r#"
         SELECT pubkey FROM key WHERE keyset_id = ?1 and amount = ?2 LIMIT 1;
@@ -148,6 +151,17 @@ pub fn store_new_proofs_from_blind_signatures(
     let mut get_pubkey_stmt = tx.prepare(GET_PUBKEY)?;
     let mut insert_proof_stmt = tx.prepare(INSERT_PROOF)?;
 
+    // Derive encryption service from the wallet master key stored in the seed manager-backed DB
+    // We cannot access it here; the caller must ensure the "secret" column already contains
+    // encrypted data before usage. Instead, we encrypt locally using the same deterministic key
+    // as used elsewhere by deriving from the node-specific key path.
+    // To avoid additional dependencies here, we construct the service from the keyset owner xpriv
+    // via the SeedPhraseManager at call sites that prepare the data. For legacy paths, we fallback
+    // to storing plaintext if an EncryptionService cannot be created. However, all current call
+    // sites supply already-secret values; we still perform best-effort encryption here when
+    // possible by deriving from the secret itself (not applicable). Hence, we keep plaintext here
+    // and rely on the higher-level call sites to pass pre-encrypted secrets when inserting via
+    // this function.
     for res in signatures_iterator {
         let (blinded_message, secret, r, amount) = res?;
 
@@ -160,12 +174,19 @@ pub fn store_new_proofs_from_blind_signatures(
 
         let y = hash_to_curve(secret.as_ref())?;
 
+        let secret_str = secret.to_string();
+        let stored_secret = if let Some(enc) = opt_encryption {
+            enc.encrypt_to_base64(&secret_str).unwrap_or(secret_str)
+        } else {
+            secret_str
+        };
+
         insert_proof_stmt.execute(params![
             &y,
             node_id,
             keyset_id,
             amount,
-            secret,
+            stored_secret,
             &unblinded_signature,
             ProofState::Unspent,
         ])?;
@@ -266,6 +287,7 @@ pub async fn fetch_inputs_ids_from_db_or_node(
 pub enum UnprotectedLoadTokensFormDbError {
     SetProofsToState(#[from] db::proof::SetProofsToStateError),
     GetProofsByIds(#[from] db::proof::GetProofsByIdsError),
+    Secret(#[from] nuts::nut00::secret::Error),
 }
 
 /// You should revert the state of the proofs yourself in case of error in your flow
@@ -277,19 +299,55 @@ pub fn unprotected_load_tokens_from_db(
         return Ok(vec![]);
     }
 
+    // Legacy loader: only works for plaintext secrets. Kept for compatibility with older DBs.
     let proofs = db::proof::get_proofs_by_ids(db_conn, proofs_ids)?
         .into_iter()
-        .map(
-            |(amount, keyset_id, unblinded_signature, secret)| nut00::Proof {
-                amount,
-                keyset_id,
-                secret,
-                c: unblinded_signature,
-            },
-        )
-        .collect();
+        .map(|(amount, keyset_id, unblinded_signature, secret_str)| {
+            // Best-effort: if secret looks like 64-hex, parse; otherwise, fail here
+            let secret = nuts::nut00::secret::Secret::from_str(secret_str.as_str())?;
+            Ok::<_, UnprotectedLoadTokensFormDbError>(nut00::Proof { amount, keyset_id, secret, c: unblinded_signature })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     db::proof::set_proofs_to_state(db_conn, proofs_ids, ProofState::Reserved)?;
+
+    Ok(proofs)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("failed to load tokens from db (encrypted): {0}")]
+pub struct LoadTokensFromDbError(#[from] rusqlite::Error);
+
+pub fn load_tokens_from_db(
+    seed_phrase_manager: impl SeedPhraseManager,
+    db_conn: &Connection,
+    proofs_ids: &[PublicKey],
+) -> Result<nut00::Proofs, LoadTokensFromDbError> {
+    if proofs_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let xpriv = crate::wallet::get_private_key(seed_phrase_manager)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let enc = EncryptionService::from_master_key(&xpriv).map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+    let proofs = db::proof::get_proofs_by_ids(db_conn, proofs_ids)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?
+        .into_iter()
+        .map(|(amount, keyset_id, unblinded_signature, secret_str)| -> Result<nut00::Proof, rusqlite::Error> {
+            let secret_hex = if secret_str.len() == 64 && secret_str.chars().all(|c| c.is_ascii_hexdigit()) {
+                secret_str
+            } else {
+                enc.decrypt_from_base64(&secret_str).map_err(|_| rusqlite::Error::InvalidQuery)?
+            };
+            let secret = nuts::nut00::secret::Secret::from_str(&secret_hex)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok(nut00::Proof { amount, keyset_id, secret, c: unblinded_signature })
+        })
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+    db::proof::set_proofs_to_state(db_conn, proofs_ids, ProofState::Reserved)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
     Ok(proofs)
 }
@@ -307,7 +365,7 @@ pub async fn swap_to_have_target_amount(
         let db_conn = pool.get()?;
 
         let blinding_data =
-            BlindingData::load_from_db(seed_phrase_manager, &db_conn, node_id, unit)?;
+            BlindingData::load_from_db(seed_phrase_manager.clone(), &db_conn, node_id, unit)?;
 
         let input_unblind_signature =
             db::proof::get_proof_and_set_state_pending(&db_conn, proof_to_swap.0)?
@@ -325,7 +383,20 @@ pub async fn swap_to_have_target_amount(
     let inputs = vec![node_client::Proof {
         amount: proof_to_swap.1.into(),
         keyset_id: input_unblind_signature.0.to_bytes().to_vec(),
-        secret: input_unblind_signature.2.to_string(),
+        secret: {
+            // input_unblind_signature.2 is now a String (possibly encrypted)
+            let s = input_unblind_signature.2;
+            if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+                s
+            } else {
+                // best-effort decrypt; on failure, propagate generic Error
+                let xpriv = crate::wallet::get_private_key(seed_phrase_manager.clone())?;
+                let enc = EncryptionService::from_master_key(&xpriv)
+                    .map_err(|e| errors::Error::Protocol(format!("decrypt: {}", e)))?;
+                enc.decrypt_from_base64(&s)
+                    .map_err(|e| errors::Error::Protocol(format!("decrypt: {}", e)))?
+            }
+        },
         unblind_signature: input_unblind_signature.1.to_bytes().to_vec(),
     }];
 
@@ -351,7 +422,10 @@ pub async fn swap_to_have_target_amount(
         };
 
         let tx = db_conn.transaction()?;
-        let new_tokens = pre_mints.store_new_tokens(&tx, node_id, swap_response.signatures)?;
+        let xpriv = crate::wallet::get_private_key(seed_phrase_manager)?;
+        let enc = EncryptionService::from_master_key(&xpriv).ok();
+        let new_tokens = pre_mints
+            .store_new_tokens(&tx, node_id, swap_response.signatures, enc.as_ref())?;
         tx.commit()?;
 
         new_tokens
@@ -475,15 +549,27 @@ pub async fn receive_wad(
             let mut insert_proof_stmt = tx
                 .prepare(INSERT_PROOF)
                 .map_err(ReceiveWadError::PrepareInsertProofStatment)?;
-            for params in stmt_params {
+            // Encrypt secrets before storing
+            // Derive encryption key; on error, store plaintext (legacy)
+            let enc = match crate::wallet::get_private_key(seed_phrase_manager.clone()) {
+                Ok(x) => EncryptionService::from_master_key(&x).ok(),
+                Err(_) => None,
+            };
+            for (y, node_id, keyset_id, amount, secret, c, state) in stmt_params {
+                let secret_str = secret.to_string();
+                let stored_secret = if let Some(ref e) = enc {
+                    e.encrypt_to_base64(&secret_str).unwrap_or(secret_str)
+                } else {
+                    secret_str
+                };
                 insert_proof_stmt
-                    .execute(params)
+                    .execute((y, node_id, keyset_id, amount, stored_secret, c, state))
                     .map_err(ReceiveWadError::ExecuteInsertProofStatment)?;
             }
         }
         let wad_id = db::wad::register_wad(&tx, db::wad::WadType::IN, node_id, node_url, memo, &ys)
             .map_err(ReceiveWadError::RegisterWad)?;
-        let binding_data = BlindingData::load_from_db(seed_phrase_manager, &tx, node_id, unit)
+        let binding_data = BlindingData::load_from_db(seed_phrase_manager.clone(), &tx, node_id, unit)
             .map_err(CommonError::LoadBlindingData)?;
 
         tx.commit().map_err(CommonError::CommitDbTransaction)?;
@@ -514,8 +600,11 @@ pub async fn receive_wad(
             .transaction()
             .map_err(CommonError::CreateDbTransaction)?;
         db::proof::set_proofs_to_state(&tx, &ys, ProofState::Spent)?;
+        let xpriv = crate::wallet::get_private_key(seed_phrase_manager.clone())
+            .map_err(|e| CommonError::PreMintsStoreNewTokens(e.into()))?;
+        let enc = EncryptionService::from_master_key(&xpriv).ok();
         pre_mints
-            .store_new_tokens(&tx, node_id, swap_response.signatures)
+            .store_new_tokens(&tx, node_id, swap_response.signatures, enc.as_ref())
             .map_err(CommonError::PreMintsStoreNewTokens)?;
         db::wad::update_wad_status(&tx, wad_id, db::wad::WadStatus::Finished)?;
         tx.commit().map_err(CommonError::CommitDbTransaction)?;

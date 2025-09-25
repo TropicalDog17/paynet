@@ -549,8 +549,13 @@ async fn main() -> Result<()> {
                 node_and_proofs.push(((node_id, node_url), proofs_ids));
             }
 
-            let wads =
-                load_proofs_and_create_wads(&mut db_conn, node_and_proofs, unit.as_str(), memo)?;
+            let wads = load_proofs_and_create_wads(
+                &mut db_conn,
+                crate::SEED_PHRASE_MANAGER,
+                node_and_proofs,
+                unit.as_str(),
+                memo,
+            )?;
 
             match output {
                 Some((output_path, path_str)) => {

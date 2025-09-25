@@ -142,7 +142,7 @@ impl WalletOps {
             .ok_or(anyhow!("amount too big"))?;
         let (amount, unit, _) = asset.convert_to_amount_and_unit(amount)?;
         let proofs_ids = wallet::fetch_inputs_ids_from_db_or_node(
-            seed_phrase_manager,
+            seed_phrase_manager.clone(),
             self.db_pool.clone(),
             &mut self.node_client,
             self.node_id,
@@ -154,7 +154,7 @@ impl WalletOps {
 
         let mut db_conn = self.db_pool.get()?;
         let tx = db_conn.transaction()?;
-        let proofs = wallet::unprotected_load_tokens_from_db(&tx, &proofs_ids)?;
+        let proofs = wallet::load_tokens_from_db(seed_phrase_manager.clone(), &tx, &proofs_ids)?;
         let compact_proofs = proofs
             .into_iter()
             .chunk_by(|p| p.keyset_id)

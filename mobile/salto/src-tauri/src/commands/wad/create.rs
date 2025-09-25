@@ -113,6 +113,7 @@ pub async fn create_wads(
 
     let wads = wallet::send::load_proofs_and_create_wads(
         &mut db_conn,
+        crate::SEED_PHRASE_MANAGER,
         node_and_proofs,
         unit.as_str(),
         None,

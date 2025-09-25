@@ -23,11 +23,14 @@ bip39 = { workspace = true, features = ["rand"] }
 uuid = { workspace = true, features = ["v5"] }
 tonic-types = { workspace = true }
 keyring = { workspace = true, features = ["apple-native", "linux-native", "windows-native", "sync-secret-service"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["std"] }
+base64 = "0.22"
 
 # Db
 r2d2_sqlite = { workspace = true }
 r2d2 = { workspace = true }
 rusqlite = { workspace = true, features = ["uuid"] }
+rand = { workspace = true }
 
 [features]
 default = []

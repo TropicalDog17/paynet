@@ -84,7 +84,7 @@ pub async fn pay_quote(
 ) -> Result<MeltResponse, PayMeltQuoteError> {
     // Gather the proofs
     let proofs_ids = fetch_inputs_ids_from_db_or_node(
-        seed_phrase_manager,
+        seed_phrase_manager.clone(),
         pool.clone(),
         node_client,
         node_id,
@@ -96,7 +96,8 @@ pub async fn pay_quote(
     .ok_or(PayMeltQuoteError::NotEnoughFunds)?;
     let inputs = {
         let db_conn = pool.get()?;
-        unprotected_load_tokens_from_db(&db_conn, &proofs_ids)?
+        crate::load_tokens_from_db(seed_phrase_manager.clone(), &db_conn, &proofs_ids)
+            .map_err(|_e| PayMeltQuoteError::LoadTokens(rusqlite::Error::InvalidQuery))?
     };
 
     // Create melt request

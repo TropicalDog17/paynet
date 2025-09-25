@@ -206,7 +206,7 @@ async fn restore_keyset(
 
             let mut db_conn = pool.get()?;
             let tx = db_conn.transaction()?;
-            store_new_proofs_from_blind_signatures(&tx, node_id, keyset_id, iterator)?;
+            store_new_proofs_from_blind_signatures(&tx, node_id, keyset_id, iterator, None)?;
             db::keyset::set_counter(&tx, keyset_id, counter_last_known_blinded_secret + 1)?;
             tx.commit()?;
         }

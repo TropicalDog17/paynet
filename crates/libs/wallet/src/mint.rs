@@ -101,7 +101,7 @@ pub async fn redeem_quote(
 
     let blinding_data = {
         let db_conn = pool.get()?;
-        BlindingData::load_from_db(seed_phrase_manager, &db_conn, node_id, unit)?
+        BlindingData::load_from_db(seed_phrase_manager.clone(), &db_conn, node_id, unit)?
     };
 
     let pre_mints = PreMints::generate_for_amount(total_amount, &SplitTarget::None, blinding_data)?;
@@ -129,7 +129,9 @@ pub async fn redeem_quote(
     {
         let mut db_conn = pool.get()?;
         let tx = db_conn.transaction()?;
-        pre_mints.store_new_tokens(&tx, node_id, mint_response.signatures)?;
+        let xpriv = crate::wallet::get_private_key(seed_phrase_manager)?;
+        let enc = crate::crypto::EncryptionService::from_master_key(&xpriv).ok();
+        pre_mints.store_new_tokens(&tx, node_id, mint_response.signatures, enc.as_ref())?;
         db::mint_quote::set_state(&tx, quote_id, MintQuoteState::Issued)?;
         tx.commit()?;
     }

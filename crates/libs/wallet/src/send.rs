@@ -12,7 +12,7 @@ use crate::{
     errors::CommonError,
     fetch_inputs_ids_from_db_or_node,
     types::{NodeUrl, compact_wad::CompactWads},
-    unprotected_load_tokens_from_db, wad,
+    wad,
     wallet::SeedPhraseManager,
 };
 
@@ -133,11 +133,12 @@ pub enum LoadProofsAndCreateWadsError {
     #[error(transparent)]
     Common(#[from] CommonError),
     #[error(transparent)]
-    UnprotectedLoadTokensFormDb(#[from] crate::UnprotectedLoadTokensFormDbError),
+    LoadTokensFromDb(#[from] crate::LoadTokensFromDbError),
 }
 
-pub fn load_proofs_and_create_wads(
+pub fn load_proofs_and_create_wads<S: SeedPhraseManager + Clone>(
     db_conn: &mut Connection,
+    seed_phrase_manager: S,
     nodes_with_proofs: Vec<((u32, NodeUrl), Vec<PublicKey>)>,
     unit: &str,
     memo: Option<String>,
@@ -148,7 +149,8 @@ pub fn load_proofs_and_create_wads(
         .transaction()
         .map_err(CommonError::CreateDbTransaction)?;
     for ((node_id, node_url), proofs_ids) in nodes_with_proofs.iter() {
-        let proofs = unprotected_load_tokens_from_db(&tx, proofs_ids)?;
+        // For sending, secrets must be decrypted for hashing/verification
+        let proofs = crate::load_tokens_from_db(seed_phrase_manager.clone(), &tx, proofs_ids)?;
         let wad = wad::create_from_parts(node_url.clone(), unit.to_string(), memo.clone(), proofs);
         db::wad::register_wad(
             &tx,

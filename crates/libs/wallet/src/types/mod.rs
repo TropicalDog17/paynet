@@ -16,8 +16,8 @@ use rusqlite::{
 };
 
 use crate::{
-    db, errors::Error, get_active_keyset_for_unit, store_new_proofs_from_blind_signatures,
-    wallet::SeedPhraseManager,
+    crypto::EncryptionService, db, errors::Error, get_active_keyset_for_unit,
+    store_new_proofs_from_blind_signatures, wallet::SeedPhraseManager,
 };
 mod node_url;
 pub use node_url::{Error as NodeUrlError, NodeUrl};
@@ -120,6 +120,7 @@ impl PreMints {
         tx: &Transaction,
         node_id: u32,
         signatures: Vec<BlindSignature>,
+        opt_encryption: Option<&EncryptionService>,
     ) -> Result<Vec<(PublicKey, Amount)>, Error> {
         db::keyset::set_counter(
             tx,
@@ -142,6 +143,7 @@ impl PreMints {
             node_id,
             self.keyset_id,
             signatures_iterator,
+            opt_encryption,
         )?;
 
         Ok(new_tokens)
